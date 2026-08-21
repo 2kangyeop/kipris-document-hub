@@ -4,3 +4,4 @@ uvicorn==0.34.2
 openpyxl==3.1.5
 keyring==25.7.0
 PyMuPDF==1.28.2
+Pillow==11.3.0
