@@ -9,11 +9,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/2kangyeop/moip/releases/tag/v6.13.0"><strong>⬇️ KIPRIS Document Hub v6.13.0 다운로드</strong></a>
+  <a href="https://github.com/2kangyeop/kipris-document-hub/releases/tag/v6.13.0"><strong>⬇️ KIPRIS Document Hub v6.13.0 다운로드</strong></a>
   ·
   <a href="docs/KIPRIS_Document_Hub_Manual.pdf"><strong>📘 설치 및 사용설명서</strong></a>
   ·
-  <a href="https://github.com/2kangyeop/moip/releases"><strong>📦 모든 Releases</strong></a>
+  <a href="https://github.com/2kangyeop/kipris-document-hub/releases"><strong>📦 모든 Releases</strong></a>
 </p>
 
 ---
