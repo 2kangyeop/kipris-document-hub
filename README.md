@@ -1,7 +1,7 @@
 # KIPRIS Document Hub
 
 <p align="center">
-  <img src="assets/rocket_background.png" alt="KIPRIS Document Hub" width="100%">
+  <img src="assets/kipris_document_hub_banner.jpg" alt="KIPRIS Document Hub v6.13 - 특허 심사문서 자동 수집 및 PDF 검토" width="100%">
 </p>
 
 <p align="center">
