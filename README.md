@@ -1,7 +1,7 @@
 # KIPRIS Document Hub
 
 <p align="center">
-  <img src="assets/kipris_document_hub_banner.jpg" alt="KIPRIS Document Hub v6.13 - 특허 심사문서 자동 수집 및 PDF 검토" width="100%">
+  <img src="assets/kipris_document_hub_banner.jpg" alt="KIPRIS Document Hub v6.13.1 - 특허 심사문서 자동 수집 및 PDF 검토" width="100%">
 </p>
 
 <p align="center">
@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/2kangyeop/kipris-document-hub/releases/tag/v6.13.0"><strong>⬇️ KIPRIS Document Hub v6.13.0 다운로드</strong></a>
+  <a href="https://github.com/2kangyeop/kipris-document-hub/releases/tag/v6.13.1"><strong>⬇️ KIPRIS Document Hub v6.13.1 다운로드</strong></a>
   ·
   <a href="docs/KIPRIS_Document_Hub_Manual.pdf"><strong>📘 설치 및 사용설명서</strong></a>
   ·
@@ -22,9 +22,9 @@
 
 ### 1. EXE 다운로드
 
-위의 **KIPRIS Document Hub v6.13.0 다운로드**를 눌러 Release 페이지에서
+위의 **KIPRIS Document Hub v6.13.1 다운로드**를 눌러 Release 페이지에서
 
-`KIPRIS_Document_Hub_v6.13.0.exe`
+`KIPRIS_Document_Hub_v6.13.1.exe`
 
 를 내려받습니다.
 
@@ -94,13 +94,13 @@ KIPRISPlus에서 필요한 데이터 상품을 신청하고 승인받은 뒤 RES
 
 ## 배포판 정보
 
-현재 배포 버전: **v6.13.0**
+현재 배포 버전: **v6.13.1**
 
 GitHub Actions가 Windows 환경에서 자동으로 테스트와 PyInstaller 빌드를 수행하고 Release 파일을 생성합니다.
 
 배포 파일에는 다음이 포함됩니다.
 
-- `KIPRIS_Document_Hub_v6.13.0.exe`
+- `KIPRIS_Document_Hub_v6.13.1.exe`
 - 사용설명서 PDF
 - `SHA256SUMS.txt`
 
