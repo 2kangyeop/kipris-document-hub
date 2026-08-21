@@ -1,0 +1,90 @@
+name: Build Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (example: 6.13.0)"
+        required: true
+        default: "6.13.0"
+      publish_release:
+        description: "Publish a GitHub Release"
+        required: true
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}" -replace '^v', ''
+          } else {
+            $version = "${{ inputs.version }}" -replace '^v', ''
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$') {
+            throw "Invalid version: $version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=v$version" >> $env:GITHUB_OUTPUT
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: -r requirements.txt
+          python -m pip install --disable-pip-version-check --only-binary=:all: pyinstaller==6.22.2
+
+      - name: Run tests
+        shell: pwsh
+        run: python -m unittest discover -s . -p "test_*.py"
+
+      - name: Build standalone EXE
+        shell: pwsh
+        run: ./build_exe_ci.ps1 -Version "${{ steps.version.outputs.version }}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KIPRIS_Document_Hub_v${{ steps.version.outputs.version }}_Windows
+          path: release/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag' || inputs.publish_release == true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag `
+              --repo $env:GITHUB_REPOSITORY `
+              --target $env:GITHUB_SHA `
+              --title "KIPRIS Document Hub v${{ steps.version.outputs.version }}" `
+              --generate-notes `
+              --latest
+          }
+          gh release upload $tag release/* --clobber --repo $env:GITHUB_REPOSITORY
