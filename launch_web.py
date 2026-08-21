@@ -28,7 +28,7 @@ def append_log(message: str) -> Path:
 def show_error(message: str, path: Path) -> None:
     detail = (
         f"{message}\n\n"
-        "먼저 preview_windows.bat를 실행하면 자세한 오류를 확인할 수 있습니다.\n\n"
+        "오류 원인은 아래 startup.log 파일에서 확인할 수 있습니다.\n\n"
         f"시작 로그: {path}"
     )
     try:
@@ -37,6 +37,12 @@ def show_error(message: str, path: Path) -> None:
         ctypes.windll.user32.MessageBoxW(0, detail, APP_NAME, 0x10)
     except Exception:
         pass
+
+
+def resource_path(relative: str) -> Path:
+    """Return bundled resource path for both source and PyInstaller one-file builds."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / relative
 
 
 def check_installation(full: bool = False) -> None:
@@ -49,17 +55,19 @@ def check_installation(full: bool = False) -> None:
         import playwright  # noqa: F401
         import pymupdf  # noqa: F401
 
-    app_dir = Path(__file__).resolve().parent
+    # In a PyInstaller --onefile executable, bundled data is extracted under
+    # sys._MEIPASS rather than beside launch_web.py.  Use the same resource
+    # resolution rule as web_app.py so startup validation works after packaging.
     required = (
-        app_dir / "web_app.py",
-        app_dir / "web" / "index.html",
-        app_dir / "web" / "app.css",
-        app_dir / "web" / "app.js",
-        app_dir / "assets" / "rocket_background.png",
+        resource_path("web/index.html"),
+        resource_path("web/app.css"),
+        resource_path("web/app.js"),
+        resource_path("assets/rocket_background.png"),
     )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise RuntimeError("필수 프로그램 파일이 없습니다:\n" + "\n".join(missing))
+
     import web_app
 
     if not web_app.WEB_DIR.is_dir() or not web_app.ASSET_DIR.is_dir():
