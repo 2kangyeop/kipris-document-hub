@@ -1,214 +1,90 @@
-name: Zero-tolerance security hardening
+name: KIPRIS v6.13.2 TEST_ONLY build
 
 on:
-  workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
     paths:
       - '.github/workflows/security-hardening-once.yml'
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
-  harden:
+  build-test-only:
     runs-on: windows-2025
-    timeout-minutes: 35
+    timeout-minutes: 45
 
     steps:
-      - name: Checkout trusted source
+      - name: Check out trusted source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up pinned Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.12'
 
-      - name: Apply minimal fail-closed TLS hardening
+      - name: Run security policy gate
+        shell: pwsh
+        run: python security_gate.py
+
+      - name: Install SHA-256 locked dependencies
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r requirements.lock
+
+      - name: Run regression tests
+        shell: pwsh
+        run: python -m unittest discover -s . -p 'test_*.py'
+
+      - name: Build standalone v6.13.2 EXE
+        shell: pwsh
+        run: ./build_exe_ci.ps1 -Version '6.13.2'
+
+      - name: Smoke-test frozen EXE
         shell: pwsh
         run: |
-          @'
-          from pathlib import Path
-          import re
-
-          api = Path('api_client.py')
-          text = api.read_text(encoding='utf-8')
-          original = text
-          text, n_ssl = re.subn(r'^import ssl\r?\n', '', text, count=1, flags=re.M)
-          text, n_handler = re.subn(
-              r'from urllib\.request import HTTPSHandler, Request, build_opener',
-              'from urllib.request import Request, build_opener',
-              text,
-              count=1,
-          )
-          pattern = re.compile(
-              r'(?ms)^        self\.allow_insecure_tls = allow_insecure_tls\r?\n'
-              r'        self\.cancel_event = cancel_event\r?\n'
-              r'        if allow_insecure_tls:\r?\n'
-              r'            context = ssl\.SSLContext\(ssl\.PROTOCOL_TLS_CLIENT\)\r?\n'
-              r'            context\.check_hostname = False\r?\n'
-              r'            context\.verify_mode = ssl\.CERT_NONE\r?\n'
-              r'            self\.opener = build_opener\(HTTPSHandler\(context=context\)\)\r?\n'
-              r'        else:\r?\n'
-              r'            self\.opener = build_opener\(\)\r?\n'
-          )
-          replacement = (
-              '        if allow_insecure_tls:\n'
-              '            raise ValueError(\n'
-              '                "TLS 인증서 검증 비활성화는 보안 정책상 허용되지 않습니다. "\n'
-              '                "사내 CA 인증서를 Windows 신뢰 저장소에 등록해 주세요."\n'
-              '            )\n'
-              '        self.allow_insecure_tls = False\n'
-              '        self.cancel_event = cancel_event\n'
-              '        self.opener = build_opener()\n'
-          )
-          text, n_block = pattern.subn(replacement, text, count=1)
-          if (n_ssl, n_handler, n_block) != (1, 1, 1):
-              raise SystemExit(f'Refusing unsafe TLS patch: ssl={n_ssl}, handler={n_handler}, block={n_block}')
-          if any(token in text for token in ('ssl.CERT_NONE', 'check_hostname = False', 'HTTPSHandler(')):
-              raise SystemExit('TLS bypass token remains after patch.')
-          if abs(len(original) - len(text)) > 1200:
-              raise SystemExit('Unexpected api_client.py change size.')
-          api.write_text(text, encoding='utf-8', newline='\n')
-
-          web = Path('web_app.py')
-          wtext = web.read_text(encoding='utf-8')
-          wtext, n_state = re.subn(
-              r'self\.allow_insecure_tls = bool\(config\.get\("allow_insecure_tls", False\)\)',
-              'self.allow_insecure_tls = False',
-              wtext,
-              count=1,
-          )
-          if n_state != 1:
-              raise SystemExit(f'Refusing web_app.py patch: state occurrences={n_state}')
-          web.write_text(wtext, encoding='utf-8', newline='\n')
-          '@ | Set-Content -Encoding utf8 $env:RUNNER_TEMP\patch_tls.py
-          python $env:RUNNER_TEMP\patch_tls.py
-
-      - name: Write permanent security gate
-        shell: pwsh
-        run: |
-          @'
-          from __future__ import annotations
-          from pathlib import Path
-          import re
-
-          FORBIDDEN = {
-              'TLS certificate verification disabled': (
-                  r'ssl\.CERT_NONE',
-                  r'check_hostname\s*=\s*False',
-                  r'_create_unverified_context',
-                  r'(?<![A-Za-z])verify\s*=\s*False',
-              ),
-              'destructive command': (
-                  r'\brm\s+-rf\b',
-                  r'\bchmod\s+777\b',
-                  r'\bDROP\s+TABLE\b',
-              ),
+          $exe = Get-Item 'release\KIPRIS_Document_Hub_v6.13.2.exe'
+          $process = Start-Process -FilePath $exe.FullName -ArgumentList '--check' -PassThru
+          try {
+            if (-not $process.WaitForExit(30000)) {
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              throw 'Frozen EXE startup check exceeded the 30-second timeout.'
+            }
+            if ($process.ExitCode -ne 0) {
+              throw "Frozen EXE startup check failed with exit code $($process.ExitCode)."
+            }
+          } finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            }
+            $process.Dispose()
           }
-          SCAN_SUFFIXES = {'.py', '.ps1', '.bat', '.vbs', '.yml', '.yaml'}
-          EXCLUDED = {
-              Path('.github/workflows/security-hardening-once.yml'),
-              Path('security_gate.py'),
+
+      - name: Verify EXE SHA-256 checksum
+        shell: pwsh
+        run: |
+          $exe = Get-Item 'release\KIPRIS_Document_Hub_v6.13.2.exe'
+          $actual = (Get-FileHash -Algorithm SHA256 $exe.FullName).Hash.ToLowerInvariant()
+          $line = (Get-Content -LiteralPath 'release\SHA256SUMS.txt' | Select-Object -First 1).Trim()
+          if ($line -notmatch '^([0-9a-fA-F]{64})\s{2}(.+)$') {
+            throw 'Invalid SHA256SUMS.txt format.'
           }
-          violations = []
-          for path in Path('.').rglob('*'):
-              if not path.is_file() or path.suffix.lower() not in SCAN_SUFFIXES or path in EXCLUDED:
-                  continue
-              text = path.read_text(encoding='utf-8', errors='replace')
-              for label, patterns in FORBIDDEN.items():
-                  for pattern in patterns:
-                      if re.search(pattern, text, re.I):
-                          violations.append(f'{path}: {label}')
-          if violations:
-              raise SystemExit('Security policy violation(s):\n' + '\n'.join(sorted(set(violations))))
-          print('Zero-tolerance static security gate passed.')
-          '@ | Set-Content -Encoding utf8 security_gate.py
-          python security_gate.py
-
-      - name: Resolve exact Windows wheels
-        shell: pwsh
-        run: |
-          $wheelhouse = Join-Path $env:RUNNER_TEMP 'kipris-wheelhouse'
-          New-Item -ItemType Directory -Force -Path $wheelhouse | Out-Null
-          python -m pip download --disable-pip-version-check --only-binary=:all: --dest $wheelhouse -r requirements.txt pyinstaller==6.22.2
-
-      - name: Generate SHA-256 dependency lock
-        shell: pwsh
-        run: |
-          @'
-          from pathlib import Path
-          import hashlib
-          import os
-          import re
-
-          runner_temp = Path(os.environ['RUNNER_TEMP']).resolve()
-          wheelhouse = (runner_temp / 'kipris-wheelhouse').resolve()
-          try:
-              wheelhouse.relative_to(runner_temp)
-          except ValueError as exc:
-              raise SystemExit('Unsafe wheelhouse path.') from exc
-          if not wheelhouse.is_dir():
-              raise SystemExit('Wheelhouse directory is missing.')
-
-          rows = []
-          for wheel in sorted(wheelhouse.glob('*.whl')):
-              parts = wheel.stem.split('-')
-              if len(parts) < 5:
-                  raise SystemExit(f'Invalid wheel filename: {wheel.name}')
-              name = re.sub(r'[-_.]+', '-', parts[0]).lower()
-              version = parts[1]
-              digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
-              rows.append((name, version, digest, wheel.name))
-          if not rows:
-              raise SystemExit('No wheels were resolved.')
-
-          seen = set()
-          lines = [
-              '# CPython 3.12 / Windows x64 dependency lock.',
-              '# Exact resolved wheels; every package is SHA-256 pinned.',
-          ]
-          for name, version, digest, filename in sorted(rows):
-              if name in seen:
-                  raise SystemExit(f'Duplicate resolved distribution: {name}')
-              seen.add(name)
-              lines.append(f'{name}=={version} --hash=sha256:{digest}  # {filename}')
-          Path('requirements.lock').write_text('\n'.join(lines) + '\n', encoding='utf-8')
-          '@ | Set-Content -Encoding utf8 $env:RUNNER_TEMP\make_lock.py
-          python $env:RUNNER_TEMP\make_lock.py
-
-      - name: Verify locked install offline and run tests
-        shell: pwsh
-        run: |
-          $wheelhouse = Join-Path $env:RUNNER_TEMP 'kipris-wheelhouse'
-          python -m pip install --disable-pip-version-check --no-index --find-links $wheelhouse --only-binary=:all: --require-hashes -r requirements.lock
-          python security_gate.py
-          python -m unittest discover -s . -p "test_*.py"
-
-      - name: Confirm bounded change scope
-        shell: pwsh
-        run: |
-          $allowed = @('api_client.py','web_app.py','security_gate.py','requirements.lock')
-          $status = git status --porcelain
-          foreach ($line in $status) {
-            $file = $line.Substring(3).Trim()
-            if ($allowed -notcontains $file) { throw "Unexpected changed file: $file" }
+          $expected = $Matches[1].ToLowerInvariant()
+          $expectedName = $Matches[2]
+          if ($expectedName -ne $exe.Name) {
+            throw 'Checksum filename does not match EXE filename.'
           }
-          git diff --check
+          if ($actual -ne $expected) {
+            throw "SHA-256 checksum mismatch. Expected $expected, actual $actual"
+          }
+          Write-Host "Verified SHA-256: $actual"
 
-      - name: Create security review pull request
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $branch = 'security/zero-tolerance-v6.13.2-v4'
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git checkout -b $branch
-          git add api_client.py web_app.py security_gate.py requirements.lock
-          git commit -m 'Apply zero-tolerance source security hardening'
-          git push origin $branch
-          gh pr create --base main --head $branch --title 'Zero-tolerance source security hardening for v6.13.2' --body 'Removes the TLS verification bypass, prevents restoring the legacy insecure-TLS flag, adds a permanent static security gate, SHA-256 locks the exact Windows/Python wheel set, and verifies the complete dependency lock offline before running the regression suite.'
+      - name: Upload TEST_ONLY artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: KIPRIS_Document_Hub_v6.13.2_Windows_TEST_ONLY
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
