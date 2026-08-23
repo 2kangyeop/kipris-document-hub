@@ -1,4 +1,4 @@
-name: KIPRIS v6.13.2 TEST_ONLY build
+name: KIPRIS v6.13.2 TEST prerelease
 
 on:
   workflow_dispatch:
@@ -15,6 +15,8 @@ jobs:
   build-test-only:
     runs-on: windows-2025
     timeout-minutes: 45
+    permissions:
+      contents: read
 
     steps:
       - name: Check out trusted source
@@ -83,10 +85,85 @@ jobs:
           }
           Write-Host "Verified SHA-256: $actual"
 
-      - name: Upload TEST_ONLY artifact
+      - name: Upload validated TEST_ONLY artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
           name: KIPRIS_Document_Hub_v6.13.2_Windows_TEST_ONLY
           path: release/*
           if-no-files-found: error
           retention-days: 7
+
+  publish-prerelease:
+    needs: build-test-only
+    runs-on: windows-2025
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download validated artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: KIPRIS_Document_Hub_v6.13.2_Windows_TEST_ONLY
+          path: release
+
+      - name: Re-verify downloaded EXE checksum
+        shell: pwsh
+        run: |
+          $exe = Get-Item 'release\KIPRIS_Document_Hub_v6.13.2.exe'
+          $sumPath = 'release\SHA256SUMS.txt'
+          if (-not (Test-Path -LiteralPath $sumPath)) {
+            throw 'SHA256SUMS.txt is missing.'
+          }
+          $line = (Get-Content -LiteralPath $sumPath | Select-Object -First 1).Trim()
+          if ($line -notmatch '^([0-9a-fA-F]{64})\s{2}(.+)$') {
+            throw 'Invalid SHA256SUMS.txt format.'
+          }
+          $expected = $Matches[1].ToLowerInvariant()
+          $expectedName = $Matches[2]
+          $actual = (Get-FileHash -Algorithm SHA256 $exe.FullName).Hash.ToLowerInvariant()
+          if ($expectedName -ne $exe.Name -or $actual -ne $expected) {
+            throw 'Downloaded release asset checksum verification failed.'
+          }
+          Write-Host "Verified downloaded EXE SHA-256: $actual"
+
+      - name: Publish v6.13.2-test pre-release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = 'v6.13.2-test'
+          $title = 'KIPRIS Document Hub v6.13.2 TEST'
+          $notes = @'
+          TEST PRE-RELEASE
+
+          This build passed the security gate, 41 regression tests, frozen EXE startup check, and SHA-256 verification.
+
+          Important: this TEST build is not Authenticode code-signed yet. Use it for evaluation before the signed production release.
+          '@
+
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag `
+              'release\KIPRIS_Document_Hub_v6.13.2.exe' `
+              'release\KIPRIS_Document_Hub_Manual_v6.13.2.pdf' `
+              'release\SHA256SUMS.txt' `
+              --repo $env:GITHUB_REPOSITORY `
+              --target $env:GITHUB_SHA `
+              --title $title `
+              --notes $notes `
+              --prerelease
+            if ($LASTEXITCODE -ne 0) {
+              throw 'GitHub pre-release creation failed.'
+            }
+          } else {
+            gh release upload $tag `
+              'release\KIPRIS_Document_Hub_v6.13.2.exe' `
+              'release\KIPRIS_Document_Hub_Manual_v6.13.2.pdf' `
+              'release\SHA256SUMS.txt' `
+              --clobber `
+              --repo $env:GITHUB_REPOSITORY
+            if ($LASTEXITCODE -ne 0) {
+              throw 'GitHub pre-release asset upload failed.'
+            }
+          }
