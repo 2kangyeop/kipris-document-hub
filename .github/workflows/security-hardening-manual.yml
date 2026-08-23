@@ -1,0 +1,45 @@
+name: Zero-tolerance security hardening (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  rerun-latest-harden:
+    runs-on: windows-2025
+    timeout-minutes: 5
+
+    steps:
+      - name: Re-run latest completed hardening workflow
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $endpoint = "repos/$env:GITHUB_REPOSITORY/actions/workflows/security-hardening-once.yml/runs?branch=main&per_page=1"
+          $json = gh api $endpoint
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub API 조회에 실패했습니다."
+          }
+
+          $data = $json | ConvertFrom-Json
+          if (-not $data.workflow_runs -or $data.workflow_runs.Count -lt 1) {
+            throw "재실행할 보안 하드닝 Run을 찾지 못했습니다."
+          }
+
+          $run = $data.workflow_runs[0]
+          if ($run.head_branch -ne 'main') {
+            throw "보안 정책 위반: main 브랜치 Run이 아닙니다."
+          }
+          if ($run.status -ne 'completed') {
+            throw "가장 최근 보안 하드닝 Run이 아직 완료되지 않았습니다. 완료 후 다시 실행해 주세요."
+          }
+
+          Write-Host "Re-running security hardening run $($run.id) at commit $($run.head_sha)"
+          gh api --method POST "repos/$env:GITHUB_REPOSITORY/actions/runs/$($run.id)/rerun"
+          if ($LASTEXITCODE -ne 0) {
+            throw "보안 하드닝 Run 재실행 요청에 실패했습니다."
+          }
