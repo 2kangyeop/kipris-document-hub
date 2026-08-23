@@ -13,64 +13,187 @@ permissions:
 jobs:
   harden:
     runs-on: windows-2025
-    timeout-minutes: 30
+    timeout-minutes: 35
+
     steps:
       - name: Checkout trusted source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
 
-      - name: Set up pinned Python action
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Set up pinned Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.12'
-          cache: 'pip'
 
-      - name: Apply security hardening and generate secure release workflow
+      - name: Apply minimal fail-closed TLS hardening
         shell: pwsh
         run: |
           @'
           from pathlib import Path
           import re
 
-          api = Path('api_client.py')
-          text = api.read_text(encoding='utf-8')
-          text = text.replace('import ssl\n', '')
-          text = text.replace(
-              'from urllib.request import HTTPSHandler, Request, build_opener\n',
-              'from urllib.request import Request, build_opener\n',
-          )
-          old = '''        self.allow_insecure_tls = allow_insecure_tls
-          self.cancel_event = cancel_event
-          if allow_insecure_tls:
-              context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-              context.check_hostname = False
-              context.verify_mode = ssl.CERT_NONE
-              self.opener = build_opener(HTTPSHandler(context=context))
-          else:
-              self.opener = build_opener()
-          '''
-          new = '''        if allow_insecure_tls:
-              raise ValueError(
-                  "TLS 인증서 검증 비활성화는 보안 정책상 허용되지 않습니다. "
-                  "사내 CA 인증서를 Windows 신뢰 저장소에 등록해 주세요."
-              )
-          self.allow_insecure_tls = False
-          self.cancel_event = cancel_event
-          self.opener = build_opener()
-          '''
-          if old not in text:
-              raise SystemExit('Expected insecure TLS block was not found; refusing blind patch.')
-          text = text.replace(old, new, 1)
-          api.write_text(text, encoding='utf-8', newline='\n')
+          path = Path('api_client.py')
+          text = path.read_text(encoding='utf-8')
+          original = text
 
-          release = r'''name: Build signed Windows release
+          text, n_ssl = re.subn(r'^import ssl\r?\n', '', text, count=1, flags=re.M)
+          text, n_handler = re.subn(
+              r'from urllib\.request import HTTPSHandler, Request, build_opener',
+              'from urllib.request import Request, build_opener',
+              text,
+              count=1,
+          )
+
+          pattern = re.compile(
+              r'(?ms)^        self\.allow_insecure_tls = allow_insecure_tls\r?\n'
+              r'        self\.cancel_event = cancel_event\r?\n'
+              r'        if allow_insecure_tls:\r?\n'
+              r'            context = ssl\.SSLContext\(ssl\.PROTOCOL_TLS_CLIENT\)\r?\n'
+              r'            context\.check_hostname = False\r?\n'
+              r'            context\.verify_mode = ssl\.CERT_NONE\r?\n'
+              r'            self\.opener = build_opener\(HTTPSHandler\(context=context\)\)\r?\n'
+              r'        else:\r?\n'
+              r'            self\.opener = build_opener\(\)\r?\n'
+          )
+          replacement = (
+              '        if allow_insecure_tls:\n'
+              '            raise ValueError(\n'
+              '                "TLS 인증서 검증 비활성화는 보안 정책상 허용되지 않습니다. "\n'
+              '                "사내 CA 인증서를 Windows 신뢰 저장소에 등록해 주세요."\n'
+              '            )\n'
+              '        self.allow_insecure_tls = False\n'
+              '        self.cancel_event = cancel_event\n'
+              '        self.opener = build_opener()\n'
+          )
+          text, n_block = pattern.subn(replacement, text, count=1)
+
+          if (n_ssl, n_handler, n_block) != (1, 1, 1):
+              raise SystemExit(
+                  f'Refusing unsafe patch: ssl={n_ssl}, handler={n_handler}, tls_block={n_block}'
+              )
+          if any(token in text for token in ('ssl.CERT_NONE', 'check_hostname = False', 'HTTPSHandler(')):
+              raise SystemExit('TLS bypass token remains after patch.')
+          if len(original) - len(text) > 1000:
+              raise SystemExit('Unexpectedly large api_client.py change; refusing patch.')
+          path.write_text(text, encoding='utf-8', newline='\n')
+
+          web = Path('web_app.py')
+          wtext = web.read_text(encoding='utf-8')
+          wtext2, n_state = re.subn(
+              r'self\.allow_insecure_tls = bool\(config\.get\("allow_insecure_tls", False\)\)',
+              'self.allow_insecure_tls = False',
+              wtext,
+              count=1,
+          )
+          if n_state != 1:
+              raise SystemExit(f'Refusing web_app patch: expected state assignment once, got {n_state}')
+          web.write_text(wtext2, encoding='utf-8', newline='\n')
+          '@ | Set-Content -Encoding utf8 $env:RUNNER_TEMP\patch_tls.py
+          python $env:RUNNER_TEMP\patch_tls.py
+
+      - name: Add permanent security policy gate
+        shell: pwsh
+        run: |
+          @'
+          from __future__ import annotations
+          from pathlib import Path
+          import re
+
+          FORBIDDEN = {
+              'TLS certificate verification disabled': (
+                  r'ssl\.CERT_NONE',
+                  r'check_hostname\s*=\s*False',
+                  r'_create_unverified_context',
+                  r'(?<![A-Za-z])verify\s*=\s*False',
+              ),
+              'destructive command': (
+                  r'\brm\s+-rf\b',
+                  r'\bchmod\s+777\b',
+                  r'\bDROP\s+TABLE\b',
+              ),
+          }
+          SCAN_SUFFIXES = {'.py', '.ps1', '.bat', '.vbs', '.yml', '.yaml'}
+          EXCLUDED = {
+              Path('.github/workflows/security-hardening-once.yml'),
+              Path('security_gate.py'),
+          }
+
+          violations = []
+          for path in Path('.').rglob('*'):
+              if not path.is_file() or path.suffix.lower() not in SCAN_SUFFIXES or path in EXCLUDED:
+                  continue
+              text = path.read_text(encoding='utf-8', errors='replace')
+              for label, patterns in FORBIDDEN.items():
+                  for pattern in patterns:
+                      if re.search(pattern, text, re.I):
+                          violations.append(f'{path}: {label}')
+          if violations:
+              raise SystemExit('Security policy violation(s):\n' + '\n'.join(sorted(set(violations))))
+          print('Zero-tolerance static security gate passed.')
+          '@ | Set-Content -Encoding utf8 security_gate.py
+          python security_gate.py
+
+      - name: Download exact Windows wheels
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force wheelhouse | Out-Null
+          python -m pip download --disable-pip-version-check --only-binary=:all: --dest wheelhouse -r requirements.txt pyinstaller==6.22.2
+
+      - name: Generate SHA-256 locked dependency manifest
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          from zipfile import ZipFile
+          from email.parser import Parser
+          import hashlib
+          import re
+
+          def canonical(name: str) -> str:
+              return re.sub(r'[-_.]+', '-', name).lower()
+
+          rows = []
+          for wheel in sorted(Path('wheelhouse').glob('*.whl')):
+              with ZipFile(wheel) as zf:
+                  metas = [n for n in zf.namelist() if n.endswith('.dist-info/METADATA')]
+                  if len(metas) != 1:
+                      raise SystemExit(f'Unexpected wheel metadata: {wheel.name}')
+                  meta = Parser().parsestr(zf.read(metas[0]).decode('utf-8', 'replace'))
+              rows.append((canonical(meta['Name']), meta['Version'], hashlib.sha256(wheel.read_bytes()).hexdigest(), wheel.name))
+
+          seen = set()
+          lines = [
+              '# CPython 3.12 / Windows x64 dependency lock.',
+              '# Generated from exact resolved wheels; all artifacts are SHA-256 pinned.',
+          ]
+          for name, version, digest, filename in sorted(rows):
+              if name in seen:
+                  raise SystemExit(f'Duplicate distribution: {name}')
+              seen.add(name)
+              lines.append(f'{name}=={version} --hash=sha256:{digest}  # {filename}')
+          Path('requirements.lock').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          '@ | Set-Content -Encoding utf8 $env:RUNNER_TEMP\make_lock.py
+          python $env:RUNNER_TEMP\make_lock.py
+
+      - name: Verify lock offline and run regression tests
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --no-index --find-links wheelhouse --only-binary=:all: --require-hashes -r requirements.lock
+          python security_gate.py
+          python -m unittest discover -s . -p "test_*.py"
+
+      - name: Generate hardened signed-release workflow
+        shell: pwsh
+        run: |
+          @'
+          name: Build signed Windows release
 
           on:
             workflow_dispatch:
               inputs:
                 version:
-                  description: "Release version (example: 6.13.2)"
+                  description: "Release version"
                   required: true
                   default: "6.13.2"
                 publish_release:
@@ -93,44 +216,34 @@ jobs:
             build:
               runs-on: windows-2025
               timeout-minutes: 45
-
               steps:
                 - name: Check out source
-                  uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+                  uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
                   with:
                     persist-credentials: false
 
                 - name: Set up Python
-                  uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+                  uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
                   with:
                     python-version: "3.12"
-                    cache: "pip"
-                    cache-dependency-path: requirements.lock
 
                 - name: Resolve version
                   id: version
                   shell: pwsh
                   run: |
-                    if ("${{ github.ref_type }}" -eq "tag") {
-                      $version = "${{ github.ref_name }}" -replace '^v', ''
-                    } else {
-                      $version = "${{ inputs.version }}" -replace '^v', ''
-                    }
-                    if ($version -notmatch '^\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$') {
-                      throw "Invalid version: $version"
-                    }
+                    if ("${{ github.ref_type }}" -eq "tag") { $version = "${{ github.ref_name }}" -replace '^v', '' }
+                    else { $version = "${{ inputs.version }}" -replace '^v', '' }
+                    if ($version -notmatch '^\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$') { throw "Invalid version: $version" }
                     "version=$version" >> $env:GITHUB_OUTPUT
                     "tag=v$version" >> $env:GITHUB_OUTPUT
 
                 - name: Security policy gate
                   shell: pwsh
-                  run: |
-                    python security_gate.py
+                  run: python security_gate.py
 
                 - name: Install hash-locked dependencies
                   shell: pwsh
-                  run: |
-                    python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r requirements.lock
+                  run: python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r requirements.lock
 
                 - name: Run tests
                   shell: pwsh
@@ -140,17 +253,19 @@ jobs:
                   shell: pwsh
                   run: ./build_exe_ci.ps1 -Version "${{ steps.version.outputs.version }}"
 
-                - name: Require signing secrets
+                - name: Require Authenticode secrets for publishing
+                  if: github.ref_type == 'tag' || inputs.publish_release == true
                   shell: pwsh
                   env:
                     SIGN_CERT: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_B64 }}
                     SIGN_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
                   run: |
                     if ([string]::IsNullOrWhiteSpace($env:SIGN_CERT) -or [string]::IsNullOrWhiteSpace($env:SIGN_PASSWORD)) {
-                      throw "Release blocked: Authenticode signing secrets are not configured."
+                      throw 'Release blocked: Authenticode signing secrets are not configured.'
                     }
 
                 - name: Authenticode sign executable
+                  if: github.ref_type == 'tag' || inputs.publish_release == true
                   shell: pwsh
                   env:
                     SIGN_CERT: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_B64 }}
@@ -159,32 +274,39 @@ jobs:
                     $certPath = Join-Path $env:RUNNER_TEMP 'kipris-signing.pfx'
                     try {
                       [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:SIGN_CERT))
-                      $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe |
-                        Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
-                        Sort-Object FullName -Descending |
-                        Select-Object -First 1
+                      $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe | Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } | Sort-Object FullName -Descending | Select-Object -First 1
                       if (-not $signtool) { throw 'signtool.exe not found' }
                       $exe = Get-ChildItem release\KIPRIS_Document_Hub_v*.exe | Select-Object -First 1
                       & $signtool.FullName sign /fd SHA256 /f $certPath /p $env:SIGN_PASSWORD $exe.FullName
                       if ($LASTEXITCODE -ne 0) { throw "signtool failed: $LASTEXITCODE" }
                       $signature = Get-AuthenticodeSignature $exe.FullName
                       if ($signature.Status -ne 'Valid') { throw "Invalid Authenticode signature: $($signature.Status)" }
-                    }
-                    finally {
+                    } finally {
                       if (Test-Path $certPath) { Remove-Item -LiteralPath $certPath -Force }
                     }
 
-                - name: Recreate checksums after signing
+                - name: Recreate checksum after signing
+                  if: github.ref_type == 'tag' || inputs.publish_release == true
                   shell: pwsh
                   run: |
                     $exe = Get-ChildItem release\KIPRIS_Document_Hub_v*.exe | Select-Object -First 1
                     $hash = (Get-FileHash -Algorithm SHA256 $exe.FullName).Hash.ToLowerInvariant()
                     "$hash  $($exe.Name)" | Set-Content -Encoding ascii release\SHA256SUMS.txt
 
-                - name: Upload workflow artifact
-                  uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+                - name: Upload test artifact
+                  if: github.ref_type != 'tag' && inputs.publish_release != true
+                  uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
                   with:
-                    name: KIPRIS_Document_Hub_v${{ steps.version.outputs.version }}_Windows
+                    name: KIPRIS_Document_Hub_v${{ steps.version.outputs.version }}_Windows_TEST_ONLY
+                    path: release/*
+                    if-no-files-found: error
+                    retention-days: 7
+
+                - name: Upload signed release artifact
+                  if: github.ref_type == 'tag' || inputs.publish_release == true
+                  uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+                  with:
+                    name: KIPRIS_Document_Hub_v${{ steps.version.outputs.version }}_Windows_SIGNED
                     path: release/*
                     if-no-files-found: error
                     retention-days: 30
@@ -197,119 +319,30 @@ jobs:
                   run: |
                     $tag = "${{ steps.version.outputs.tag }}"
                     gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
-                    if ($LASTEXITCODE -ne 0) {
-                      gh release create $tag --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "KIPRIS Document Hub v${{ steps.version.outputs.version }}" --generate-notes --latest
-                    }
+                    if ($LASTEXITCODE -ne 0) { gh release create $tag --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "KIPRIS Document Hub v${{ steps.version.outputs.version }}" --generate-notes --latest }
                     gh release upload $tag release/* --clobber --repo $env:GITHUB_REPOSITORY
-          '''
-          # Remove indentation introduced by embedding the YAML in this workflow script.
-          release = '\n'.join(line[10:] if line.startswith('          ') else line for line in release.splitlines()) + '\n'
-          Path('.github/workflows/release.yml').write_text(release, encoding='utf-8', newline='\n')
+          '@ | Set-Content -Encoding utf8 .github/workflows/release.yml
 
-          gate = r'''from __future__ import annotations
-
-          from pathlib import Path
-          import re
-
-          FORBIDDEN = {
-              "TLS certificate verification disabled": [
-                  r"ssl\.CERT_NONE",
-                  r"verify\s*=\s*False",
-                  r"check_hostname\s*=\s*False",
-                  r"_create_unverified_context",
-              ],
-              "destructive shell command": [
-                  r"\brm\s+-rf\b",
-                  r"\bchmod\s+777\b",
-                  r"\bDROP\s+TABLE\b",
-              ],
+      - name: Confirm expected diff scope
+        shell: pwsh
+        run: |
+          $allowed = @('api_client.py','web_app.py','security_gate.py','requirements.lock','.github/workflows/release.yml')
+          $changed = git diff --name-only
+          foreach ($file in $changed) {
+            if ($allowed -notcontains $file) { throw "Unexpected changed file: $file" }
           }
-          SCAN_SUFFIXES = {'.py', '.ps1', '.bat', '.vbs', '.yml', '.yaml'}
-          EXCLUDES = {Path('.github/workflows/security-hardening-once.yml'), Path('security_gate.py')}
+          git diff --check
 
-          failures: list[str] = []
-          for path in Path('.').rglob('*'):
-              if not path.is_file() or path.suffix.lower() not in SCAN_SUFFIXES or path in EXCLUDES:
-                  continue
-              try:
-                  text = path.read_text(encoding='utf-8', errors='replace')
-              except OSError:
-                  continue
-              for label, patterns in FORBIDDEN.items():
-                  for pattern in patterns:
-                      if re.search(pattern, text, flags=re.IGNORECASE):
-                          failures.append(f'{path}: {label} ({pattern})')
-          if failures:
-              raise SystemExit('Security policy violation(s):\n' + '\n'.join(failures))
-          print('Zero-tolerance static security gate passed.')
-          '''
-          gate = '\n'.join(line[10:] if line.startswith('          ') else line for line in gate.splitlines()) + '\n'
-          Path('security_gate.py').write_text(gate, encoding='utf-8', newline='\n')
-          '@ | Set-Content -Encoding utf8 $env:RUNNER_TEMP\harden.py
-          python $env:RUNNER_TEMP\harden.py
-
-      - name: Download Windows wheels for lock generation
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force wheelhouse | Out-Null
-          python -m pip download --disable-pip-version-check --only-binary=:all: --dest wheelhouse -r requirements.txt pyinstaller==6.22.2
-
-      - name: Generate hash-locked dependency manifest using standard library only
-        shell: pwsh
-        run: |
-          @'
-          from pathlib import Path
-          from zipfile import ZipFile
-          from email.parser import Parser
-          import hashlib
-          import re
-
-          def canonical(name: str) -> str:
-              return re.sub(r'[-_.]+', '-', name).lower()
-
-          rows = []
-          for wheel in sorted(Path('wheelhouse').glob('*.whl')):
-              with ZipFile(wheel) as zf:
-                  metas = [n for n in zf.namelist() if n.endswith('.dist-info/METADATA')]
-                  if len(metas) != 1:
-                      raise SystemExit(f'Unexpected wheel metadata layout: {wheel.name}')
-                  meta = Parser().parsestr(zf.read(metas[0]).decode('utf-8', 'replace'))
-              name = canonical(meta['Name'])
-              version = meta['Version']
-              digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
-              rows.append((name, version, digest, wheel.name))
-
-          seen = set()
-          lines = [
-              '# Generated for CPython 3.12 / Windows x64 by the reviewed hardening workflow.',
-              '# Every resolved build/runtime wheel is SHA-256 pinned.',
-          ]
-          for name, version, digest, filename in sorted(rows):
-              if name in seen:
-                  raise SystemExit(f'Duplicate resolved distribution: {name}')
-              seen.add(name)
-              lines.append(f'{name}=={version} --hash=sha256:{digest}  # {filename}')
-          Path('requirements.lock').write_text('\n'.join(lines) + '\n', encoding='utf-8')
-          '@ | Set-Content -Encoding utf8 $env:RUNNER_TEMP\make_lock.py
-          python $env:RUNNER_TEMP\make_lock.py
-
-      - name: Verify locked install offline and run tests
-        shell: pwsh
-        run: |
-          python -m pip install --disable-pip-version-check --no-index --find-links wheelhouse --only-binary=:all: --require-hashes -r requirements.lock
-          python security_gate.py
-          python -m unittest discover -s . -p "test_*.py"
-
-      - name: Create review branch and pull request
+      - name: Create security review pull request
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $branch = 'security/zero-tolerance-v6.13.2'
+          $branch = 'security/zero-tolerance-v6.13.2-v2'
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git checkout -b $branch
-          git add -- api_client.py requirements.lock security_gate.py .github/workflows/release.yml
-          git commit -m 'Harden release pipeline for zero-tolerance security'
+          git add api_client.py web_app.py security_gate.py requirements.lock .github/workflows/release.yml
+          git commit -m 'Harden v6.13.2 security and release pipeline'
           git push origin $branch
-          gh pr create --base main --head $branch --title 'Zero-tolerance security hardening for v6.13.2' --body 'Removes TLS verification bypass, adds a static security gate, hash-locks all Windows/Python dependencies, pins GitHub Actions by immutable commit SHA, fixes the runner to windows-2025, and makes Authenticode signing mandatory before artifacts or Releases can be published.'
+          gh pr create --base main --head $branch --title 'Security hardening for KIPRIS Document Hub v6.13.2' --body 'Fail-closed TLS policy, permanent static security gate, SHA-256 dependency lock, immutable GitHub Action pins, fixed Windows 2025 runner, regression tests, and mandatory Authenticode signing before any GitHub Release is published.'
