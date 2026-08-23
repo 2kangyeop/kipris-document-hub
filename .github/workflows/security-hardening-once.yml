@@ -127,6 +127,55 @@ jobs:
           }
           Write-Host "Verified downloaded EXE SHA-256: $actual"
 
+      - name: Create safety verification report
+        shell: pwsh
+        run: |
+          $exe = Get-Item 'release\KIPRIS_Document_Hub_v6.13.2.exe'
+          $hash = (Get-FileHash -Algorithm SHA256 $exe.FullName).Hash.ToLowerInvariant()
+          $report = @"
+          # KIPRIS Document Hub v6.13.2 TEST - 안전성 점검 결과
+
+          검증 대상: KIPRIS_Document_Hub_v6.13.2.exe
+          GitHub Actions Run: $env:GITHUB_RUN_ID
+          Commit: $env:GITHUB_SHA
+          EXE SHA-256: $hash
+
+          ## 종합 판정
+          **CI 검증 범위 내 PASS**
+
+          ## 1. 보안 기준 - PASS (CI 검증 범위 내)
+          - Zero-tolerance static security gate: PASS
+          - TLS 인증서 검증 우회 패턴 차단: PASS
+          - 최소 권한 원칙: build job은 contents:read, publish job만 contents:write
+          - 회귀 테스트 스위트: PASS (현재 검증 스위트 41 tests)
+          - Frozen EXE startup check: PASS
+          - 하드코딩된 배포용 비밀값 사용 없음: PASS (GitHub token은 Actions 제공 토큰 사용)
+
+          ## 2. 공급망 기준 - PASS (CI 검증 범위 내)
+          - Python 의존성 정확 버전 고정: PASS
+          - requirements.lock SHA-256 hash 검증(--require-hashes): PASS
+          - GitHub Actions immutable commit SHA 고정: PASS
+          - 빌드 후 EXE SHA-256 검증: PASS
+          - Artifact 다운로드 후 SHA-256 재검증: PASS
+
+          ## 3. 인프라/자원 안전성 기준 - PASS (CI 검증 범위 내)
+          - GitHub job 실행시간 상한: PASS (build 45분, publish 15분)
+          - Frozen EXE 시작 검사 상한: PASS (30초)
+          - 타임아웃 시 프로세스 강제 종료 및 Dispose 처리: PASS
+          - 비정상 무한 대기 방지: PASS (검증된 실행 경로 기준)
+
+          ## 남은 제한사항 / 비차단 경고
+          - 이 TEST Pre-release는 Authenticode 코드서명 전 빌드입니다. 정식 production release로 간주하지 않습니다.
+          - 정식 침투 테스트(penetration test)와 장시간 부하/메모리 누수 시험을 대체하지 않습니다.
+          - GitHub runner에서 actions/checkout의 Node 20 대상 코드가 Node 24로 강제 실행된다는 비차단 deprecation 경고가 있습니다.
+          - PyInstaller에서 tzdata hidden import 미탐지 경고가 있었으나 frozen EXE startup check는 성공했습니다.
+
+          ## 배포 판정
+          TEST Pre-release 배포: **허용**
+          Production 정식 배포: **보류 - Authenticode 코드서명 및 최종 배포 검증 필요**
+          "@
+          $report | Set-Content -LiteralPath 'release\SAFETY_CHECK_v6.13.2-test.md' -Encoding utf8
+
       - name: Publish v6.13.2-test pre-release
         shell: pwsh
         env:
@@ -135,11 +184,20 @@ jobs:
           $tag = 'v6.13.2-test'
           $title = 'KIPRIS Document Hub v6.13.2 TEST'
           $notes = @'
-          TEST PRE-RELEASE
+          ## TEST PRE-RELEASE
 
-          This build passed the security gate, 41 regression tests, frozen EXE startup check, and SHA-256 verification.
+          이 빌드는 Zero-tolerance security gate, 회귀 테스트(현재 41 tests), frozen EXE startup check 및 SHA-256 무결성 검증을 통과했습니다.
 
-          Important: this TEST build is not Authenticode code-signed yet. Use it for evaluation before the signed production release.
+          ### 안전성 점검 결과
+          - 보안 기준: **PASS (CI 검증 범위 내)**
+          - 공급망 기준: **PASS (CI 검증 범위 내)**
+          - 인프라/자원 안전성 기준: **PASS (CI 검증 범위 내)**
+          - TEST Pre-release 배포: **허용**
+          - Production 정식 배포: **보류**
+
+          자세한 판정 근거와 제한사항은 첨부된 `SAFETY_CHECK_v6.13.2-test.md`를 확인하십시오.
+
+          **중요:** 이 TEST 빌드는 아직 Authenticode 코드서명 전입니다. 정식 production release로 사용하지 마십시오.
           '@
 
           gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
@@ -148,6 +206,7 @@ jobs:
               'release\KIPRIS_Document_Hub_v6.13.2.exe' `
               'release\KIPRIS_Document_Hub_Manual_v6.13.2.pdf' `
               'release\SHA256SUMS.txt' `
+              'release\SAFETY_CHECK_v6.13.2-test.md' `
               --repo $env:GITHUB_REPOSITORY `
               --target $env:GITHUB_SHA `
               --title $title `
@@ -157,10 +216,19 @@ jobs:
               throw 'GitHub pre-release creation failed.'
             }
           } else {
+            gh release edit $tag `
+              --repo $env:GITHUB_REPOSITORY `
+              --title $title `
+              --notes $notes `
+              --prerelease
+            if ($LASTEXITCODE -ne 0) {
+              throw 'GitHub pre-release metadata update failed.'
+            }
             gh release upload $tag `
               'release\KIPRIS_Document_Hub_v6.13.2.exe' `
               'release\KIPRIS_Document_Hub_Manual_v6.13.2.pdf' `
               'release\SHA256SUMS.txt' `
+              'release\SAFETY_CHECK_v6.13.2-test.md' `
               --clobber `
               --repo $env:GITHUB_REPOSITORY
             if ($LASTEXITCODE -ne 0) {
