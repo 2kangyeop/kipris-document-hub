@@ -1,228 +1,90 @@
-name: Build signed Windows release
+name: Build v6.13.2 TEST_ONLY
 
 on:
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Release version"
-        required: true
-        default: "6.13.2"
-      publish_release:
-        description: "Publish a signed GitHub Release"
-        required: true
-        type: boolean
-        default: false
-  pull_request:
+  push:
     branches: [main]
     paths:
       - '.github/workflows/release.yml'
-  push:
-    tags:
-      - "v*"
 
 permissions:
   contents: read
 
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
-  build:
+  validate-test-build:
     runs-on: windows-2025
     timeout-minutes: 45
-    permissions:
-      contents: read
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      tag: ${{ steps.version.outputs.tag }}
-      publish: ${{ steps.version.outputs.publish }}
-      artifact_name: ${{ steps.version.outputs.artifact_name }}
 
     steps:
-      - name: Check out source
+      - name: Check out trusted source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
 
-      - name: Set up Python
+      - name: Set up pinned Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: "3.12"
+          python-version: '3.12'
 
-      - name: Resolve version and release mode
-        id: version
-        shell: pwsh
-        run: |
-          if ("${{ github.ref_type }}" -eq "tag") {
-            $version = "${{ github.ref_name }}" -replace '^v', ''
-            $publish = $true
-          } elseif ("${{ github.event_name }}" -eq "pull_request") {
-            $version = "6.13.2"
-            $publish = $false
-          } else {
-            $version = "${{ inputs.version }}" -replace '^v', ''
-            $publish = "${{ inputs.publish_release }}" -eq "true"
-          }
-          if ($version -notmatch '^\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$') {
-            throw "Invalid version: $version"
-          }
-          $suffix = if ($publish) { 'SIGNED' } else { 'TEST_ONLY' }
-          "version=$version" >> $env:GITHUB_OUTPUT
-          "tag=v$version" >> $env:GITHUB_OUTPUT
-          "publish=$($publish.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
-          "artifact_name=KIPRIS_Document_Hub_v${version}_Windows_${suffix}" >> $env:GITHUB_OUTPUT
-
-      - name: Security policy gate
+      - name: Run security policy gate
         shell: pwsh
         run: python security_gate.py
 
-      - name: Install hash-locked dependencies
+      - name: Install SHA-256 locked dependencies
         shell: pwsh
         run: python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r requirements.lock
 
       - name: Run regression tests
         shell: pwsh
-        run: python -m unittest discover -s . -p "test_*.py"
+        run: python -m unittest discover -s . -p 'test_*.py'
 
-      - name: Build standalone EXE
+      - name: Build standalone v6.13.2 EXE
         shell: pwsh
-        run: ./build_exe_ci.ps1 -Version "${{ steps.version.outputs.version }}"
+        run: ./build_exe_ci.ps1 -Version '6.13.2'
 
-      - name: Smoke test frozen EXE with timeout
+      - name: Smoke-test frozen EXE
         shell: pwsh
         run: |
-          $exe = Get-ChildItem -LiteralPath release -Filter 'KIPRIS_Document_Hub_v*.exe' -File
-          if ($exe.Count -ne 1) {
-            throw "Expected exactly one release EXE, found $($exe.Count)."
-          }
-          $psi = [System.Diagnostics.ProcessStartInfo]::new()
-          $psi.FileName = $exe[0].FullName
-          $psi.Arguments = '--check'
-          $psi.UseShellExecute = $false
-          $psi.CreateNoWindow = $true
-          $process = [System.Diagnostics.Process]::new()
-          $process.StartInfo = $psi
+          $exe = Get-Item 'release\KIPRIS_Document_Hub_v6.13.2.exe'
+          $process = Start-Process -FilePath $exe.FullName -ArgumentList '--check' -PassThru
           try {
-            if (-not $process.Start()) {
-              throw 'Failed to start frozen EXE smoke test.'
-            }
             if (-not $process.WaitForExit(30000)) {
-              try { $process.Kill($true) } catch { }
-              $process.WaitForExit()
-              throw 'Frozen EXE smoke test timed out after 30 seconds.'
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              throw 'Frozen EXE startup check exceeded the 30-second timeout.'
             }
             if ($process.ExitCode -ne 0) {
               throw "Frozen EXE startup check failed with exit code $($process.ExitCode)."
             }
           } finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            }
             $process.Dispose()
           }
 
-      - name: Require Authenticode secrets before publishing
-        if: steps.version.outputs.publish == 'true'
+      - name: Verify EXE SHA-256 checksum
         shell: pwsh
-        env:
-          SIGN_CERT: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_B64 }}
-          SIGN_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:SIGN_CERT) -or [string]::IsNullOrWhiteSpace($env:SIGN_PASSWORD)) {
-            throw 'Release blocked: Authenticode signing secrets are not configured.'
+          $exe = Get-Item 'release\KIPRIS_Document_Hub_v6.13.2.exe'
+          $actual = (Get-FileHash -Algorithm SHA256 $exe.FullName).Hash.ToLowerInvariant()
+          $line = (Get-Content -LiteralPath 'release\SHA256SUMS.txt' | Select-Object -First 1).Trim()
+          if ($line -notmatch '^([0-9a-fA-F]{64})\s{2}(.+)$') {
+            throw 'Invalid SHA256SUMS.txt format.'
           }
-
-      - name: Authenticode sign executable
-        if: steps.version.outputs.publish == 'true'
-        shell: pwsh
-        env:
-          SIGN_CERT: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_B64 }}
-          SIGN_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
-        run: |
-          $certPath = Join-Path $env:RUNNER_TEMP 'kipris-signing.pfx'
-          try {
-            [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:SIGN_CERT))
-            $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe -File |
-              Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
-              Sort-Object FullName -Descending |
-              Select-Object -First 1
-            if (-not $signtool) { throw 'signtool.exe not found.' }
-            $exe = Get-ChildItem -LiteralPath release -Filter 'KIPRIS_Document_Hub_v*.exe' -File
-            if ($exe.Count -ne 1) { throw "Expected exactly one EXE for signing, found $($exe.Count)." }
-            & $signtool.FullName sign /fd SHA256 /f $certPath /p $env:SIGN_PASSWORD $exe[0].FullName
-            if ($LASTEXITCODE -ne 0) { throw "signtool failed with exit code $LASTEXITCODE." }
-            $signature = Get-AuthenticodeSignature $exe[0].FullName
-            if ($signature.Status -ne 'Valid') {
-              throw "Invalid Authenticode signature: $($signature.Status)"
-            }
-          } finally {
-            if (Test-Path -LiteralPath $certPath) {
-              Remove-Item -LiteralPath $certPath -Force
-            }
-          }
-
-      - name: Recreate SHA-256 checksum after signing
-        if: steps.version.outputs.publish == 'true'
-        shell: pwsh
-        run: |
-          $exe = Get-ChildItem -LiteralPath release -Filter 'KIPRIS_Document_Hub_v*.exe' -File
-          if ($exe.Count -ne 1) { throw "Expected exactly one EXE for hashing, found $($exe.Count)." }
-          $hash = (Get-FileHash -Algorithm SHA256 $exe[0].FullName).Hash.ToLowerInvariant()
-          "$hash  $($exe[0].Name)" | Set-Content -Encoding ascii release\SHA256SUMS.txt
-
-      - name: Upload validated artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
-        with:
-          name: ${{ steps.version.outputs.artifact_name }}
-          path: release/*
-          if-no-files-found: error
-          retention-days: ${{ steps.version.outputs.publish == 'true' && 30 || 7 }}
-
-  publish:
-    if: needs.build.outputs.publish == 'true'
-    needs: build
-    runs-on: windows-2025
-    timeout-minutes: 15
-    permissions:
-      contents: write
-
-    steps:
-      - name: Download signed artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: ${{ needs.build.outputs.artifact_name }}
-          path: release
-
-      - name: Verify downloaded checksum and signature
-        shell: pwsh
-        run: |
-          $exe = Get-ChildItem -LiteralPath release -Filter 'KIPRIS_Document_Hub_v*.exe' -File
-          if ($exe.Count -ne 1) { throw "Expected exactly one downloaded EXE, found $($exe.Count)." }
-          $sumPath = Join-Path 'release' 'SHA256SUMS.txt'
-          if (-not (Test-Path -LiteralPath $sumPath)) { throw 'SHA256SUMS.txt is missing.' }
-          $line = (Get-Content -LiteralPath $sumPath -Raw).Trim()
-          if ($line -notmatch '^([0-9a-fA-F]{64})\s{2}(.+)$') { throw 'Invalid SHA256SUMS.txt format.' }
           $expected = $Matches[1].ToLowerInvariant()
           $expectedName = $Matches[2]
-          if ($expectedName -ne $exe[0].Name) { throw 'Checksum filename does not match downloaded EXE.' }
-          $actual = (Get-FileHash -Algorithm SHA256 $exe[0].FullName).Hash.ToLowerInvariant()
-          if ($actual -ne $expected) { throw 'Downloaded EXE SHA-256 mismatch.' }
-          $signature = Get-AuthenticodeSignature $exe[0].FullName
-          if ($signature.Status -ne 'Valid') { throw "Downloaded EXE signature is not valid: $($signature.Status)" }
-
-      - name: Publish GitHub Release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $tag = "${{ needs.build.outputs.tag }}"
-          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag `
-              --repo $env:GITHUB_REPOSITORY `
-              --target $env:GITHUB_SHA `
-              --title "KIPRIS Document Hub v${{ needs.build.outputs.version }}" `
-              --generate-notes `
-              --latest
-            if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed.' }
+          if ($expectedName -ne $exe.Name) {
+            throw 'Checksum filename does not match EXE filename.'
           }
-          gh release upload $tag release/* --clobber --repo $env:GITHUB_REPOSITORY
-          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release upload failed.' }
+          if ($actual -ne $expected) {
+            throw "SHA-256 checksum mismatch. Expected $expected, actual $actual"
+          }
+          Write-Host "Verified SHA-256: $actual"
+
+      - name: Upload TEST_ONLY artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: KIPRIS_Document_Hub_v6.13.2_Windows_TEST_ONLY
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
