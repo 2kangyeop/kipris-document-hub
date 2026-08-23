@@ -82,3 +82,11 @@ jobs:
             throw "SHA-256 checksum mismatch. Expected $expected, actual $actual"
           }
           Write-Host "Verified SHA-256: $actual"
+
+      - name: Upload TEST_ONLY artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: KIPRIS_Document_Hub_v6.13.2_Windows_TEST_ONLY
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
