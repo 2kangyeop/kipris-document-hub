@@ -3,7 +3,6 @@ from __future__ import annotations
 import html
 import os
 import re
-import ssl
 import tempfile
 import threading
 import xml.etree.ElementTree as ET
@@ -12,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.parse import urlparse
-from urllib.request import HTTPSHandler, Request, build_opener
+from urllib.request import Request, build_opener
 
 from core import (
     NumberItem,
@@ -211,15 +210,14 @@ class KiprisApiClient:
         self.api_key = api_key.strip()
         self.google_fallback = google_fallback
         self.log = log
-        self.allow_insecure_tls = allow_insecure_tls
-        self.cancel_event = cancel_event
         if allow_insecure_tls:
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            self.opener = build_opener(HTTPSHandler(context=context))
-        else:
-            self.opener = build_opener()
+            raise ValueError(
+                "TLS 인증서 검증 비활성화는 보안 정책상 허용되지 않습니다. "
+                "사내 CA 인증서를 Windows 신뢰 저장소에 등록해 주세요."
+            )
+        self.allow_insecure_tls = False
+        self.cancel_event = cancel_event
+        self.opener = build_opener()
         self.headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
