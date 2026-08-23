@@ -132,7 +132,7 @@ class JobState:
         self.output_dir = Path(
             config.get("output_dir") or default_output_dir()
         ).expanduser()
-        self.allow_insecure_tls = bool(config.get("allow_insecure_tls", False))
+        self.allow_insecure_tls = False
         self.updated_at = time.time()
 
     def log(self, message: Any) -> None:
