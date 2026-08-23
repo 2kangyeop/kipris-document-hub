@@ -132,8 +132,9 @@ jobs:
       - name: Resolve exact Windows wheels
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force wheelhouse | Out-Null
-          python -m pip download --disable-pip-version-check --only-binary=:all: --dest wheelhouse -r requirements.txt pyinstaller==6.22.2
+          $wheelhouse = Join-Path $env:RUNNER_TEMP 'kipris-wheelhouse'
+          New-Item -ItemType Directory -Force -Path $wheelhouse | Out-Null
+          python -m pip download --disable-pip-version-check --only-binary=:all: --dest $wheelhouse -r requirements.txt pyinstaller==6.22.2
 
       - name: Generate SHA-256 dependency lock
         shell: pwsh
@@ -141,10 +142,20 @@ jobs:
           @'
           from pathlib import Path
           import hashlib
+          import os
           import re
 
+          runner_temp = Path(os.environ['RUNNER_TEMP']).resolve()
+          wheelhouse = (runner_temp / 'kipris-wheelhouse').resolve()
+          try:
+              wheelhouse.relative_to(runner_temp)
+          except ValueError as exc:
+              raise SystemExit('Unsafe wheelhouse path.') from exc
+          if not wheelhouse.is_dir():
+              raise SystemExit('Wheelhouse directory is missing.')
+
           rows = []
-          for wheel in sorted(Path('wheelhouse').glob('*.whl')):
+          for wheel in sorted(wheelhouse.glob('*.whl')):
               parts = wheel.stem.split('-')
               if len(parts) < 5:
                   raise SystemExit(f'Invalid wheel filename: {wheel.name}')
@@ -152,6 +163,8 @@ jobs:
               version = parts[1]
               digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
               rows.append((name, version, digest, wheel.name))
+          if not rows:
+              raise SystemExit('No wheels were resolved.')
 
           seen = set()
           lines = [
@@ -170,7 +183,8 @@ jobs:
       - name: Verify locked install offline and run tests
         shell: pwsh
         run: |
-          python -m pip install --disable-pip-version-check --no-index --find-links wheelhouse --only-binary=:all: --require-hashes -r requirements.lock
+          $wheelhouse = Join-Path $env:RUNNER_TEMP 'kipris-wheelhouse'
+          python -m pip install --disable-pip-version-check --no-index --find-links $wheelhouse --only-binary=:all: --require-hashes -r requirements.lock
           python security_gate.py
           python -m unittest discover -s . -p "test_*.py"
 
