@@ -12,6 +12,10 @@ on:
         required: true
         type: boolean
         default: false
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/release.yml'
   push:
     tags:
       - "v*"
@@ -53,6 +57,9 @@ jobs:
           if ("${{ github.ref_type }}" -eq "tag") {
             $version = "${{ github.ref_name }}" -replace '^v', ''
             $publish = $true
+          } elseif ("${{ github.event_name }}" -eq "pull_request") {
+            $version = "6.13.2"
+            $publish = $false
           } else {
             $version = "${{ inputs.version }}" -replace '^v', ''
             $publish = "${{ inputs.publish_release }}" -eq "true"
